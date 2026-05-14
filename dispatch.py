@@ -1,0 +1,64 @@
+import asyncio
+import os
+import uuid
+import json
+from livekit import api
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
+async def main():
+    phone_number = os.getenv("PHONE_NUMBER")
+    print(f"Using phone number: {phone_number}")
+    if not phone_number:
+        raise SystemExit("PHONE_NUMBER env var is required (e.g. PHONE_NUMBER=+966555209485)")
+
+    agent_name = os.getenv("AGENT_NAME", "gemini-native-audio")
+    sip_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
+    if not sip_trunk_id:
+        raise SystemExit("SIP_OUTBOUND_TRUNK_ID env var is required")
+
+    metadata = {
+        "phone_number": phone_number,
+        "name": os.getenv("CUSTOMER_NAME", "أحمد"),
+        "amount": os.getenv("DEBT_AMOUNT", "10000"),
+        "debt_date": os.getenv("DEBT_DATE", "2023-01-01"),
+        "national_id_last4": os.getenv("NATIONAL_ID_LAST4", "1234"),
+        "dob": os.getenv("CUSTOMER_DOB", "1990-01-01"),
+    }
+
+    lk_api = api.LiveKitAPI()
+    room_name = f"outbound-call-{uuid.uuid4().hex[:8]}"
+
+    try:
+        await lk_api.room.create_room(api.CreateRoomRequest(name=room_name))
+        print(f"Created room: {room_name}")
+
+        dispatch_request = api.CreateAgentDispatchRequest(
+            agent_name=agent_name,
+            room=room_name,
+            metadata=json.dumps(metadata, ensure_ascii=False),
+        )
+
+        await lk_api.agent_dispatch.create_dispatch(dispatch_request)
+        print(f"Dispatched agent '{agent_name}' to room '{room_name}'.")
+
+        await lk_api.sip.create_sip_participant(
+            api.CreateSIPParticipantRequest(
+                sip_trunk_id=sip_trunk_id,
+                sip_call_to=phone_number,
+                room_name=room_name,
+                participant_identity="phone_user",
+                participant_name=metadata["name"],
+                wait_until_answered=True,
+            )
+        )
+        print(f"Dialing {phone_number}. Customer: {metadata['name']}, Amount: {metadata['amount']} SAR")
+
+    except Exception as e:
+        print(f"Failed to dispatch agent: {e}")
+    finally:
+        await lk_api.aclose()
+
+if __name__ == "__main__":
+    asyncio.run(main())

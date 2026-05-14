@@ -1,0 +1,8 @@
+{
+  "name": "Tawafq Law Voice Assistant",
+  "description": "A professional AI-powered customer support voice agent for a law firm, providing real-time legal intake and assistance.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": []
+}
