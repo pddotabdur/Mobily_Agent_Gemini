@@ -8,6 +8,7 @@ from livekit import api
 from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli, RunContext, get_job_context
 
 from livekit.agents.llm import function_tool
+from livekit.agents.voice.speech_handle import SpeechHandle
 from livekit.plugins import google
 
 from metrics_logger import setup_metrics
@@ -449,16 +450,29 @@ class Assistant(Agent):
         record_outcome first."""
         if self._outcome is None:
             logger.warning("end_call invoked without record_outcome")
-        # Let the final TTS audio finish playing before tearing down the room.
-        await asyncio.sleep(1.5)
+
+        # Schedule the room teardown to fire AFTER the agent's current turn
+        # has fully played out (closing line + any tool reply). Awaiting the
+        # speech handle here would deadlock — the speech handle is itself
+        # waiting for this tool to return — so we attach a done-callback and
+        # return immediately. This is the same pattern LiveKit's beta
+        # EndCallTool uses, and it replaces the brittle fixed sleep that was
+        # cutting the goodbye off mid-syllable.
         job_ctx = get_job_context()
-        try:
-            await job_ctx.api.room.delete_room(
-                api.DeleteRoomRequest(room=job_ctx.room.name)
-            )
-            logger.info("call ended by end_call tool")
-        except Exception as e:
-            logger.warning(f"end_call hangup failed: {e}")
+        room_name = job_ctx.room.name
+
+        def _on_speech_done(_: SpeechHandle) -> None:
+            async def _hangup() -> None:
+                try:
+                    await job_ctx.api.room.delete_room(
+                        api.DeleteRoomRequest(room=room_name)
+                    )
+                    logger.info("call ended by end_call tool")
+                except Exception as e:
+                    logger.warning(f"end_call hangup failed: {e}")
+            asyncio.create_task(_hangup())
+
+        ctx.speech_handle.add_done_callback(_on_speech_done)
         return None
 
 server = AgentServer()
