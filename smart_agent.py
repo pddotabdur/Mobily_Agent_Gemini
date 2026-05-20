@@ -1,11 +1,16 @@
 """
 Tawafuq / Mobily debt-collection agent (Najdi Arabic, system-prompt-driven).
 
-Implements the workflow in `mobily-debt-collection-logic.md`:
+Implements the workflow in `debit.pdf`:
   Stage 1 — right-party verification + ID-last4 yes/no check
-  Stage 2 — QA recording disclosure + debt intro + reason capture
-  Stage 3 — negotiation ladder: full today/tomorrow → half exception → instalments
-  Stage 4 — recap + payment methods (SADAD biller code 005) + close
+  Stage 2 — QA recording disclosure + debt intro (with SIMAH avoidance line)
+            + reason capture (hardship-aware)
+  Stage 3 — negotiation ladder: full today/tomorrow → half exception (week)
+            → customer-named instalments with 30%/25% percentage check
+            and one gentle push; stalemate disclosure (SIMAH + legal + court)
+            only if customer still denies after the ladder
+  Stage 4 — recap + payment methods (SADAD biller code 055) + receipt request
+            + follow-up note when first instalment is below 25% + close
 
 STT is selectable via the STT_PROVIDER env var ("munsit" or "soniox") so we can
 A/B latency. Munsit STT runs in streaming mode for the call. TTS is Faseeh.
@@ -97,10 +102,24 @@ class CallData:
     identity_confirmed: bool = False
     id_verified: bool = False
     id_yes_no_attempts: int = 0
-    consequences_said: bool = False
+    consequences_said: bool = False  # Stage-2 SIMAH-avoidance soft line
+    stalemate_disclosed: bool = False  # Stage-3 stalemate (legal/court) line
     debt_clarification_given: bool = False
     ladder_attempt: int = 0  # 0=not started, 1=full, 2=half, 3=instalments
     vague_attempts: int = 0
+
+    # PDF 3.2: hardship signal flips Stage-3 opening from full-payment ask
+    # to a softened half/half offer with empathy.
+    hardship_signaled: bool = False
+    # PDF 3.2: "already paid" path captures when the payment was made and
+    # asks for a receipt before closing.
+    payment_made_when: str | None = None
+    # PDF 3.3: percentage check on customer-named instalment — one gentle
+    # push allowed if below 25 %.
+    gentle_pushed: bool = False
+    # PDF 3.3 / 3.4: locked plan was below the 25 % threshold — Stage 4 adds
+    # one warm follow-up line about reaching out for the remainder.
+    below_threshold_commit: bool = False
 
     # Outcomes
     outcome: str | None = None
@@ -393,10 +412,17 @@ def _apply_pronunciation(text: str) -> str:
 
 
 def _najdi_normalize(text: str) -> str:
-    # SADAD biller code 005 — speak as "صفر صفر خمسة" not "خمسة".
+    # SADAD biller code 055 — speak as "خمسة خمسة صفر" not "خمسة" and not
+    # "صفر صفر خمسة" (the canonical wording in the spec reads the digits in
+    # the order 0-5-5 left-to-right → "خمسة خمسة صفر" in spoken Arabic).
+    text = re.sub(
+        r"(?i)\b(?:biller code|كود المفوتر|الكود)\s*0*55\b",
+        "كود المفوتر خمسة خمسة صفر",
+        text,
+    )
     text = re.sub(
         r"(?i)\b(?:biller code|كود المفوتر|الكود)\s*0*5\b",
-        "كود المفوتر صفر صفر خمسة",
+        "كود المفوتر خمسة خمسة صفر",
         text,
     )
     # Plain amounts → words + "ريال سعودي".
@@ -491,11 +517,49 @@ COMPLIANCE (Stage 1):
 - Until identity is verified, NEVER disclose the debt amount or any
   account detail. No threats, no legal scare language.
 
+SPECIAL SITUATIONS that can interrupt any stage (PDF section 4):
+
+- CANCELLED LINE ("وقفت الخط", "ألغيت الخط"): reply ONCE in one short
+  sentence, then return to the pending question. Canonical: "حتى لو
+  وقفت الخط، المبلغ اللي عليك يبقى مستحق، لأنه كان فيه عقد التزام لمدة
+  ١٢ شهر، ومع الإيقاف ينحسب عليك غرامة إنهاء ولازم تنسدد." Never argue.
+
+- PORTED NUMBER ("نقلت الرقم", "حوّلت لمشغل ثاني"): reply ONCE in one
+  short sentence, then return to the pending question. Canonical: "حتى
+  لو نقلت الرقم، المديونية تبقى على الحساب وما تنسقط؛ اللي عليك عقد
+  وغرامة إنهاء ولازم تنسدد." Never argue.
+
+- CUSTOMER ASKS FOR INVOICE / SERVICE DETAILS at ANY stage: summarise
+  naturally — at most TWO line items per reply. Each item: service type,
+  amount in words, subscription date if available, and ONLY the last
+  four digits of the service number ("الرقم المنتهي بـ ..."). Never
+  read internal IDs or full service numbers. If a line item is
+  unavailable, briefly point them to the Mobily app, a branch, or 1100.
+  Then return to the pending question.
+
+- "ALO? CAN YOU HEAR ME?" RECOVERY (الو / تسمعيني / صوتك مقطع):
+  reply briefly "إيه سامعك" then repeat ONLY the last pending question
+  once. NEVER reset the call with a fresh greeting.
+
+- SILENCE: repeat the question ONCE. If still no response, move to a
+  polite close.
+
+- UNCLEAR / GARBLED reply: ONE neutral clarification, "معذرة، ما فهمت
+  — ممكن تعيد؟" Never guess intent from a partial reply.
+
+- MIXED REPLY (answers the pending question AND raises a new concern in
+  the same turn): address the new concern in ONE sentence, then return
+  to where the conversation was. Do not restart context.
+
+- ABUSIVE / THREATENING language (sustained): say once "أرجو أن نتواصل
+  باحترام متبادل. هل تريد الاستمرار؟" If the abuse continues, end the
+  call professionally without elaboration.
+
 TOOLS:
 - When the customer's reply triggers a transition described in the stage
   section, CALL THE TOOL. Do not keep talking.
-- For clarifications, reply in ONE short sentence and re-pose the
-  current question without a tool.
+- For clarifications and the special situations above, reply in ONE short
+  sentence and re-pose the current question WITHOUT calling a tool.
 """
 
 
@@ -996,45 +1060,60 @@ class ScheduleCallbackAgent(BaseCallAgent):
 # ============================================================
 
 STAGE2_TASK = """\
-Current stage: 2 — QA disclosure + debt intro + reason.
+Current stage: 2 — QA disclosure + debt intro + reason (PDF 3.2).
 
-You MUST run TWO short script-fixed turns in sequence (one turn each):
+This stage runs as ONE single connected turn (script-fixed):
 
-Turn A (QA disclosure):
-  "شكراً {addressed_name}، هذه المكالمة قد تكون مسجّلة لأغراض الجودة."
-
-Turn B (debt intro + reason question):
-  "أُكَلِّمَكْ بِخُصُوصْ حْسَابَكْ فِي مُوبَايْلِي — عَلَيْكْ مَبْلَغْ
-  مُتَأَخِّرْ قَدْرَهْ {amount_words} رِيَالْ وَلَمْ يُسَدَّدْ.
+  "شكراً {addressed_name}، أنا نورا من توافق، وهذه المكالمة قد تكون
+  مسجّلة لأغراض الجودة. أُكَلِّمَكْ بِخُصُوصْ حْسَابَكْ فِي مُوبَايْلِي —
+  عَلَيْكْ مَبْلَغْ مُتَأَخِّرْ قَدْرَهْ {amount_words} رِيَالْ، وَتَسْوِيَتَهْ
+  تْجَنِّبَكْ أَيْ تَأْثِيرْ سَلْبِي عَلَى سِجِلَّكْ الِائْتِمَانِي فِي سِمَه.
   إِيشْ سَبَبْ التَّأْخِيرْ؟"
+
 The amount above is ALREADY in Arabic words ({amount_words}). NEVER emit the
-amount as digits — say it exactly as written.
+amount as digits — say it exactly as written. The SIMAH line is framed as
+"resolving it avoids a negative impact" — soft, never as a threat.
 
-If the customer answers Turn B with bare "نعم/طيب/تمام/اوكي" without a reason,
-re-ask ONCE: "أقصد، إيش الذي يمنعك من السداد؟"
+How to interpret the customer's reply (PDF 3.2):
 
-If the customer says he ALREADY PAID (سددت / دفعت / تم الدفع):
-  → call already_paid.
+1. Clear reason given (financial difficulty, forgot, traveling, etc.):
+   → call reason_captured. If the reason contains hardship phrases
+     ("ما معي فلوس", "ظروف", "الأمور صعبة", "لاحق", "ما أقدر",
+     "ضايقة", "راتب ما نزل", …) pass hardship=True so Stage 3 opens
+     with empathy and the half/half offer.
 
-If the customer says he does NOT recognise / know the debt
-("ما أعرف هالفاتورة", "أنا ما عليّ شي"):
-  → call clarify_debt FIRST. After clarification, re-ask: "بعد التوضيح،
-    إيش سبب التأخير؟" Do NOT treat as dispute yet.
+2. Vague "نعم / طيب / تمام / اوكي" without a reason:
+   → re-ask ONCE: "قصدي، وش سبب تأخيرك بالسداد؟" and do NOT call a tool.
+   → on the second turn, regardless of the reply, call reason_captured
+     (hardship=False if you can't tell).
 
-If the customer disputes flatly after clarification (still says "مو حقي"):
-  → call disputes_debt.
+3. Customer says ALREADY PAID (سددت / دفعت / تم الدفع):
+   → do NOT call already_paid_done yet. First ask in ONE sentence
+     "طيب يعطيك العافية، متى تم السداد؟ ولاهنت أرسل لنا إيصال السداد
+     للتحقق." Wait for the reply, then call already_paid_done(when_text)
+     with whatever they answered (or "غير محدد" if they didn't say).
 
-Otherwise, when a reason is captured (or he denies/refuses to engage):
-  → call reason_captured.
+4. Customer says he does NOT recognise / know the debt
+   ("ما أعرف هالفاتورة", "أنا ما عليّ شي", "وش تقصدين؟"):
+   → call clarify_debt. After it explains 1-2 service items, re-ask
+     "بعد التوضيح، وش سبب تأخرك بالسداد؟" — and on the customer's reply,
+     ALWAYS continue into negotiation via reason_captured (PDF says even
+     a flat post-clarification denial continues into negotiation; the real
+     dispute path is the Stage-3 stalemate). Set denied_after_clarify=True
+     so Stage 3 knows to use the calm "تم التحقق من الهوية والمبلغ ثابت
+     على حسابك" reminder before opening.
 
 TOOLS:
-- already_paid
+- already_paid_done(when_text): call AFTER you've asked when payment was made
+  and reminded the customer to send the receipt.
 - clarify_debt: explain 1-2 service items from the services array using
-  amount + subscription_date + last4 of service number, then re-ask reason.
-  Call ONCE; after this, treat further denial as disputes_debt.
-- disputes_debt
-- reason_captured: any concrete reason / denial / hardship — go to Stage 3.
+  type + amount in words + subscription_date + last4 of service number,
+  then re-ask the reason. Call ONCE per call.
+- reason_captured(hardship, denied_after_clarify): proceed to Stage 3.
 - unclear: re-pose the previous question.
+
+Never call a "dispute" tool here — dispute is reserved for the Stage-3
+stalemate disclosure path.
 """
 
 
@@ -1053,42 +1132,53 @@ class Stage2DebtIntroAgent(BaseCallAgent):
         self.data = data
 
     async def on_enter(self):
-        # Turn A: QA disclosure + Turn B: debt intro, as one connected reply.
-        # All script lines are pre-vocalized with diacritics so Faseeh
-        # pronounces them correctly. The amount is pre-formatted as Arabic
-        # words — never digits — so it can never be mispronounced as
-        # digit-by-digit.
+        # Single connected reply per PDF 3.2: thank → QA disclosure → debt
+        # intro with amount + SIMAH-avoidance soft line → reason question.
+        # The SIMAH mention is framed as "resolving it avoids a negative
+        # impact" — soft, never as a threat. The amount is pre-formatted as
+        # Arabic words — never digits — so it cannot be mispronounced.
         amount_words = _amount_in_arabic_words(self.data)
+        self.data.consequences_said = True  # SIMAH-avoidance line is delivered here
         self.session.generate_reply(
             instructions=(
                 f'Say this EXACTLY as a single connected reply (the diacritics '
-                f'are mandatory — do NOT remove them):\n'
-                f'"شُكْرَنْ {_addressed_name(self.data)}، هَذِهْ الْمُكَالَمَة '
-                f'قَدْ تْكُونْ مُسَجَّلَة لِأَغْرَاضْ الْجَوْدَة. '
-                f'أُكَلِّمَكْ بِخُصُوصْ حْسَابَكْ فِي مُوبَايْلِي — عَلَيْكْ '
-                f'مَبْلَغْ مُتَأَخِّرْ قَدْرَهْ {amount_words} رِيَالْ '
-                f'وَلَمْ يُسَدَّدْ. إِيشْ سَبَبْ التَّأْخِيرْ؟"\n'
-                f'NEVER emit the amount as digits.'
+                f'are mandatory — do NOT remove them, do NOT emit digits):\n'
+                f'"شُكْرَنْ {_addressed_name(self.data)}، أَنَا نُورَا مِنْ '
+                f'تَوَافُقْ، وَهَذِهْ الْمُكَالَمَة قَدْ تْكُونْ مُسَجَّلَة '
+                f'لِأَغْرَاضْ الْجَوْدَة. أُكَلِّمَكْ بِخُصُوصْ حْسَابَكْ '
+                f'فِي مُوبَايْلِي — عَلَيْكْ مَبْلَغْ مُتَأَخِّرْ قَدْرَهْ '
+                f'{amount_words} رِيَالْ، وَتَسْوِيَتَهْ تْجَنِّبَكْ أَيْ '
+                f'تَأْثِيرْ سَلْبِي عَلَى سِجِلَّكْ الِائْتِمَانِي فِي '
+                f'سِمَه. إِيشْ سَبَبْ التَّأْخِيرْ؟"'
             )
         )
 
     @function_tool()
-    async def already_paid(self, ctx: RunContext[CallData]):
-        """Customer claims it's already paid."""
+    async def already_paid_done(
+        self, ctx: RunContext[CallData], when_text: str = "غير محدد",
+    ):
+        """Customer claims it's already paid AND you have already asked
+        when the payment was made and reminded them to send the receipt.
+
+        Args:
+            when_text: short free-text of when they said they paid
+                       (e.g. "أمس", "قبل يومين", "غير محدد").
+        """
+        ctx.userdata.payment_made_when = when_text
         ctx.userdata.outcome = "paid"
         return ClosingAgent(self.data, intent="paid", chat_ctx=None)
 
     @function_tool()
     async def clarify_debt(self, ctx: RunContext[CallData]):
-        """Customer says he doesn't recognise the debt — explain service
-        details (amount, subscription date, last4 of service number) and
-        re-ask the reason. Call this ONCE per call."""
-        if ctx.userdata.debt_clarification_given:
-            # Second denial after clarification — treat as dispute.
-            ctx.userdata.outcome = "dispute"
-            _emit_outcome(ctx.userdata, "dispute_open")
-            return ClosingAgent(self.data, intent="dispute", chat_ctx=None)
+        """Customer says he doesn't recognise the debt — explain 1-2
+        service items (type, amount in words, subscription_date, last4 of
+        service number) and re-ask the reason. Call this ONCE per call.
 
+        Per PDF 3.2: after clarification, ANY post-clarification reply
+        continues into negotiation — there is no dispute closing from
+        Stage 2. Mark the call so Stage 3 opens with the calm reminder
+        if the customer still denies.
+        """
         ctx.userdata.debt_clarification_given = True
         services = self.data.services[:2] or [{}]
         lines = []
@@ -1096,33 +1186,48 @@ class Stage2DebtIntroAgent(BaseCallAgent):
             stype = s.get("type", "خدمة")
             sub = s.get("subscription_date", "غير متوفر")
             last4 = s.get("service_number_last4", "")
-            tail = f"وآخر ٤ أرقام {last4}" if last4 else ""
+            tail = f"الرقم المنتهي بـ {last4}" if last4 else ""
             lines.append(f"{stype} منذ {sub} {tail}".strip())
         explain = "؛ ".join(lines)
         self.session.generate_reply(
             instructions=(
-                f'Explain briefly: "تفاصيل المبلغ: {explain}." Then ask: '
-                f'"بعد التوضيح، إيش سبب التأخير؟" TWO short sentences max.'
+                f'Explain briefly (max two line items): "{explain}." Then ask: '
+                f'"بعد التوضيح، وش سبب تأخرك بالسداد؟" TWO short sentences '
+                "max. Do NOT call any tool in this turn — wait for the reply."
             )
         )
 
     @function_tool()
-    async def disputes_debt(self, ctx: RunContext[CallData]):
-        """Customer disputes the debt after clarification."""
-        ctx.userdata.outcome = "dispute"
-        _emit_outcome(ctx.userdata, "dispute_open")
-        return ClosingAgent(self.data, intent="dispute", chat_ctx=None)
+    async def reason_captured(
+        self,
+        ctx: RunContext[CallData],
+        hardship: bool = False,
+        denied_after_clarify: bool = False,
+    ):
+        """A reason / denial / hardship was given — go to Stage 3.
 
-    @function_tool()
-    async def reason_captured(self, ctx: RunContext[CallData]):
-        """A reason / denial / hardship was given — go to Stage 3."""
-        return Stage3NegotiationAgent(self.data, chat_ctx=None)
+        Args:
+            hardship: True if the reason indicates financial pressure
+                      ("ما معي فلوس", "ظروف", "الأمور صعبة", "ما أقدر",
+                      "راتب ما نزل"…). Stage 3 will open with empathy
+                      and a softened half/half offer rather than the
+                      standard full-payment ask.
+            denied_after_clarify: True only if clarify_debt was already
+                      called this call AND the customer still denies.
+                      Stage 3 will open with the calm reminder line.
+        """
+        ctx.userdata.hardship_signaled = bool(hardship)
+        return Stage3NegotiationAgent(
+            self.data,
+            denied_after_clarify=bool(denied_after_clarify),
+            chat_ctx=None,
+        )
 
     @function_tool()
     async def unclear(self, ctx: RunContext[CallData]):
         """Re-pose the reason question once."""
         self.session.generate_reply(
-            instructions='Re-ask: "أقصد، إيش الذي يمنعك من السداد؟" One short sentence.'
+            instructions='Re-ask: "قصدي، وش سبب تأخيرك بالسداد؟" One short sentence.'
         )
 
 
@@ -1131,70 +1236,120 @@ class Stage2DebtIntroAgent(BaseCallAgent):
 # ============================================================
 
 STAGE3_TASK = """\
-Current stage: 3 — Negotiation ladder.
+Current stage: 3 — Negotiation ladder (PDF 3.3).
 
 Outstanding amount in Arabic words (always speak this form, NEVER digits):
 {amount_words} ريال.
+Outstanding amount in digits (for INTERNAL percentage math only, NEVER say
+this aloud): {amount_digits} SAR.
 
-DETERMINISTIC FIRST TURN (consequences line — say ONCE per call, not again).
-The diacritics are mandatory:
-  "لِلْعِلْمْ، نِحْتَاجْ تَسْوِيَة الْمَوْضُوعْ خِلَالْ سَبْعَة أَيَّامْ،
-  وَإِلَّا قَدْ يْأَثِّرْ عَلَى سِجِلَّكْ الِائْتِمَانِي وَيُرْفَعْ لِـ
-  سِمَه حَسَبْ الْإِجْرَاءَاتْ."
+GOAL: leave the call with a concrete commitment — ideally full payment
+today or tomorrow. If the customer cannot, step down the ladder.
 
-After that line, immediately move into Attempt 1 — say it as ONE connected
-reply, do NOT repeat or rephrase the consequences line.
+OPENING — depends on whether hardship was signaled in Stage 2:
 
-LADDER (one short question per turn, ack briefly between turns).
-All script lines below are pre-vocalized — keep diacritics intact.
-
-Attempt 1 — full today/tomorrow:
+(A) hardship_signaled = False — standard ask (Attempt 1, full payment):
   "تِقْدَرْ تْسَدِّدْ الْمَبْلَغْ كَامِلْ الْيَوْمْ أَوْ بُكْرَا؟"
-  • Yes (full today/tomorrow) → call commit_full(when_iso).
-  • No / can't → ack briefly, then Attempt 2.
 
-Attempt 2 — half exception:
-  "كَاسْتِثْنَاءْ، تِقْدَرْ تْسَدِّدْ النِّصْفْ الْيَوْمْ أَوْ خِلَالْ
-  يَوْمَيْنْ، وَالْبَاقِي بِتَارِيخْ تِخْتَارَهْ؟"
-  • Yes → ask the date for the second half, then call commit_two_step(
-    first_amount, first_date_iso, rest_amount, rest_date_iso).
-  • No → Attempt 3.
+(B) hardship_signaled = True — warm empathy + softened half offer
+    (this REPLACES Attempt 1 with Attempt 2 framing):
+  "يَعِينَكْ اللهْ، نِدْرِي الْمَوْضُوعْ مُو سَهَلْ، إِحْنَا مَعَكْ.
+   كَاسْتِثْنَاءْ عَنْ الْمُعْتَادْ، تِقْدَرْ تْسَدِّدْ النِّصْفْ
+   الْيَوْمْ أَوْ بُكْرَا، وَالْبَاقِي خِلَالْ أُسْبُوعْ؟"
 
-Attempt 3 — customer-named instalments:
-  "كَمْ أَقَلْ مَبْلَغْ تِقْدَرْ تِلْتَزِمْ فِيهْ، وَفِي أَيْ تَارِيخْ
-  بِالضَّبْطْ؟"
-  Then: "وَالْبَاقِي مَتَى تِقْدَرْ تْسَدِّدَهْ؟"
-  • Plan agreed → call commit_two_step(...).
-  • Vague after ONE clarification → call commit_partial_then_callback(
-    first_amount, first_date_iso) if at least the initial is set, else
-    call vague_response.
+(C) denied_after_clarify = True — calm reminder THEN the opening above:
+  "تَمْ التَّحَقُّقْ مِنْ الْهَوِيَّة، وَالْمَبْلَغْ ثَابِتْ عَلَى
+   حْسَابَكْ وَلَازِمْ يَنْسَدِّدْ." Then continue with (A) or (B)
+   based on hardship_signaled.
 
-VAGUE TIMING ("آخر الشهر / هذا الأسبوع / لما ينزل الراتب"):
-  Ask ONE clarifying question to pin an exact day:
-    "أي يوم بالضبط؟ مثلاً ٣٠؟"
-  Never assume a date. If still vague after one clarification → callback.
+LADDER (one short question per turn, ONE-word ack between turns):
 
-OUTCOMES (call EXACTLY one tool):
-- commit_full(when_iso)
+Attempt 1 — FULL today or tomorrow (no exception framing — this is the ideal).
+Attempt 2 — HALF today/tomorrow + rest within a week, FRAMED AS EXCEPTION:
+  "كَاسْتِثْنَاءْ عَنْ الْمُعْتَادْ، تِقْدَرْ تْسَدِّدْ النِّصْفْ الْيَوْمْ
+   أَوْ بُكْرَا، وَالْبَاقِي خِلَالْ أُسْبُوعْ؟"
+Attempt 3 — customer-named amount + date, FRAMED AS EXCEPTION:
+  "كَاسْتِثْنَاءْ عَنْ الْمُعْتَادْ، وش أَعْلَى مَبْلَغْ تِقْدَرْ
+   تِلْتَزِمْ فِيهْ هَالْفَتْرَة؟"
+  Then ask: "مَتَى تِقْدَرْ تْسَدِّدْ هَالْمَبْلَغْ؟"
+  Then ask: "وَالْبَاقِي مَتَى تِقْدَرْ تْسَدِّدَهْ؟"
+
+EXCEPTION FRAMING: every offer OTHER THAN Attempt 1 (full payment) MUST be
+introduced with "كاستثناء عن المعتاد" / "نستثني معك". Never present
+instalments as routine.
+
+BETWEEN ATTEMPTS — optional gentle procedural nudge (NOT a threat, only
+ONCE, NEVER legal/court — those are reserved for the stalemate disclosure):
+  "خَلِّنَا نْسَكِّرْهَا قَبْلْ مَا تِتْرَفَعْ لِسِمَه وَيْصِيرْ عَلَيْهَا
+   إِجْرَاءَاتْ وَتَأْثِيرْ عَلَى سِجِلَّكْ الِائْتِمَانِي." Allowed only
+when the customer is NOT denying the debt.
+
+MID-LADDER HARDSHIP: if the customer expresses pressure mid-ladder, ONE
+empathic line first ("يَعِينَكْ اللهْ، نِدْرِي الْمَوْضُوعْ مُو سَهَلْ،
+إِحْنَا مَعَكْ.") then continue the ladder.
+
+PERCENTAGE CHECK (PDF 3.3) — call propose_installment(first_amount,
+first_date_iso) whenever the customer NAMES a specific first-instalment
+amount. The tool computes first_amount / total and:
+  • >= 30 % → accept with encouragement, locks the plan.
+  • 25-30 % → accept with reassurance, locks the plan.
+  • <  25 % AND no gentle push yet → ONE gentle push, framed as
+    exception: "كَاسْتِثْنَاءْ عَنْ الْمُعْتَادْ، تِقْدَرْ تْرَفَعَهْ
+    لِحُدُودْ خَمْسَة وَعِشْرِينْ بِالْمِيَّة أَوْ ثَلَاثِينْ؟"
+  • <  25 % AFTER the gentle push → accept anyway with reassurance and
+    note that we will follow up for the remainder.
+Never push more than once. Never guilt-trip.
+
+VAGUE DATES ("آخر الشهر / هذا الأسبوع / لما ينزل الراتب"): ask ONE
+clarifying question to pin a date ("أي يوم بالضبط؟ مثلاً ثلاثين؟").
+Steer toward within seven days. If still vague after one clarification,
+do NOT keep asking — call vague_response to switch to a callback.
+
+STALEMATE (PDF 3.3) — customer keeps denying the debt after working
+through the ladder (NOT after a single denial). At that point call
+stalemate_disclose ONCE. The tool delivers the canonical line:
+  "التَّأْخِيرْ مُمْكِنْ يِنْعَكِسْ عَلَى سِجِلَّكْ الِائْتِمَانِي فِي
+   سِمَه. وَلَوْ مَا تَمْ السَّدَادْ، مُمْكِنْ يِتْرَتَّبْ عَلَى ذَلِكْ
+   إِجْرَاءَاتْ قَانُونِيَّة وَرُسُومْ مَحْكَمَة حَسَبْ الْإِجْرَاءَاتْ
+   الْمُتَّبَعَة."
+Then ask ONE final commitment question ("نقدر نتفق على مبلغ وتاريخ
+الآن؟"). If still refuses → call disputes_debt to direct them to the
+official dispute channel.
+
+TOOLS (call EXACTLY one):
+- commit_full(when_iso) — full payment today or tomorrow.
 - commit_two_step(first_amount, first_date_iso, rest_amount, rest_date_iso)
+- propose_installment(first_amount, first_date_iso) — runs the
+  percentage check; may push once, then locks the plan.
 - commit_partial_then_callback(first_amount, first_date_iso) — initial
-  agreed but rest is vague; we'll follow up.
-- vague_response — no concrete number/date after offers.
-- refuses_payment — flat refusal.
-- disputes_debt — claims it's not his / wrong amount.
-- already_paid — asserts already paid.
+  agreed but rest is genuinely vague after ONE clarification.
+- vague_response — no concrete amount/date even after clarification.
+- refuses_payment — flat refusal (not a denial). Closing will deliver
+  the credit-record line once.
+- stalemate_disclose — customer keeps denying after ladder; delivers
+  the SIMAH + legal-action + court-fees line ONCE.
+- disputes_debt — customer still refuses to commit after the stalemate
+  disclosure → routed to the official dispute channel.
+- already_paid_done(when_text) — asserts already paid; ask when + receipt
+  before calling.
 - unclear — ambiguous; re-ask the SAME question.
 
 HARD RULES:
 - ONE short sentence per turn (8-14 words).
 - Acknowledgements are ONE word: "أبشر" / "زين" / "تمام" / "طيب".
-- Hardship → ONE-word ack, then next question.
-- Mention سمة ONLY in the consequences line above. Never repeat it.
+- Never threaten. Legal/court wording belongs ONLY in stalemate_disclose.
+- Mention سمة only via the gentle nudge or the stalemate disclosure.
 """
 
 
 class Stage3NegotiationAgent(BaseCallAgent):
-    def __init__(self, data: CallData, *, chat_ctx: ChatContext | None = None) -> None:
+    def __init__(
+        self,
+        data: CallData,
+        *,
+        denied_after_clarify: bool = False,
+        chat_ctx: ChatContext | None = None,
+    ) -> None:
         try:
             self._amount_int = int(str(data.amount).strip())
         except ValueError:
@@ -1202,38 +1357,47 @@ class Stage3NegotiationAgent(BaseCallAgent):
         super().__init__(
             instructions=stage_instructions(
                 data,
-                STAGE3_TASK.format(amount_words=_amount_in_arabic_words(data)),
+                STAGE3_TASK.format(
+                    amount_words=_amount_in_arabic_words(data),
+                    amount_digits=str(data.amount),
+                ),
             ),
             chat_ctx=chat_ctx,
         )
         self.data = data
+        self.denied_after_clarify = denied_after_clarify
 
     async def on_enter(self):
-        if not self.data.consequences_said:
-            self.data.consequences_said = True
-            self.session.generate_reply(
-                instructions=(
-                    'Say the consequences line + Attempt 1 EXACTLY as ONE '
-                    'connected reply (diacritics mandatory, do NOT repeat or '
-                    'rephrase any part):\n'
-                    '"لِلْعِلْمْ، نِحْتَاجْ تَسْوِيَة الْمَوْضُوعْ خِلَالْ '
-                    'سَبْعَة أَيَّامْ، وَإِلَّا قَدْ يْأَثِّرْ عَلَى '
-                    'سِجِلَّكْ الِائْتِمَانِي وَيُرْفَعْ لِـ سِمَه حَسَبْ '
-                    'الْإِجْرَاءَاتْ. تِقْدَرْ تْسَدِّدْ الْمَبْلَغْ '
-                    'كَامِلْ الْيَوْمْ أَوْ بُكْرَا؟"'
-                )
+        hardship = self.data.hardship_signaled
+        if self.denied_after_clarify:
+            # PDF 3.2 stalemate-into-negotiation: calm reminder, then open.
+            opener = (
+                'Say EXACTLY as ONE connected reply (diacritics mandatory):\n'
+                '"تَمْ التَّحَقُّقْ مِنْ الْهَوِيَّة، وَالْمَبْلَغْ ثَابِتْ '
+                'عَلَى حْسَابَكْ وَلَازِمْ يَنْسَدِّدْ. '
             )
         else:
-            self.session.generate_reply(
-                instructions=(
-                    'Ask Attempt 1 EXACTLY: "تِقْدَرْ تْسَدِّدْ الْمَبْلَغْ '
-                    'كَامِلْ الْيَوْمْ أَوْ بُكْرَا؟"'
-                )
+            opener = "Say EXACTLY (diacritics mandatory): \""
+        if hardship:
+            opener += (
+                'يَعِينَكْ اللهْ، نِدْرِي الْمَوْضُوعْ مُو سَهَلْ، إِحْنَا '
+                'مَعَكْ. كَاسْتِثْنَاءْ عَنْ الْمُعْتَادْ، تِقْدَرْ تْسَدِّدْ '
+                'النِّصْفْ الْيَوْمْ أَوْ بُكْرَا، وَالْبَاقِي خِلَالْ '
+                'أُسْبُوعْ؟"'
             )
+        else:
+            opener += (
+                'تِقْدَرْ تْسَدِّدْ الْمَبْلَغْ كَامِلْ الْيَوْمْ '
+                'أَوْ بُكْرَا؟"'
+            )
+        self.session.generate_reply(instructions=opener)
+
+    # ----- ladder commits -----
 
     @function_tool()
     async def commit_full(self, ctx: RunContext[CallData], when_iso: str):
-        """Customer commits to pay the FULL outstanding amount in one transfer.
+        """Customer commits to pay the FULL outstanding amount in one
+        transfer today or tomorrow (Attempt 1 — the ideal outcome).
 
         Args:
             when_iso: ISO date (YYYY-MM-DD) of the single payment.
@@ -1242,6 +1406,7 @@ class Stage3NegotiationAgent(BaseCallAgent):
             f"full payment of {self.data.amount} SAR on {when_iso}"
         )
         ctx.userdata.outcome = "committed"
+        ctx.userdata.below_threshold_commit = False
         return Stage4RecapAgent(self.data, chat_ctx=None)
 
     @function_tool()
@@ -1253,7 +1418,8 @@ class Stage3NegotiationAgent(BaseCallAgent):
         rest_amount: float,
         rest_date_iso: str,
     ):
-        """Customer agreed to a two-step plan.
+        """Customer agreed to a two-step plan (Attempt 2 half/half, or
+        Attempt 3 with a concrete remainder date).
 
         Args:
             first_amount: SAR for the first payment.
@@ -1266,6 +1432,102 @@ class Stage3NegotiationAgent(BaseCallAgent):
             f"remainder {int(rest_amount)} SAR on {rest_date_iso}"
         )
         ctx.userdata.outcome = "committed"
+        ctx.userdata.below_threshold_commit = (
+            self._amount_int > 0
+            and (first_amount / self._amount_int) < 0.25
+        )
+        return Stage4RecapAgent(self.data, chat_ctx=None)
+
+    @function_tool()
+    async def propose_installment(
+        self,
+        ctx: RunContext[CallData],
+        first_amount: float,
+        first_date_iso: str,
+    ):
+        """Customer named a SPECIFIC first-instalment amount and date.
+        Runs the PDF 3.3 percentage check:
+
+          • >=30 % → accept with encouragement, lock the plan, go to recap.
+          • 25-30 % → accept with reassurance, lock the plan, go to recap.
+          • <25 % and no gentle push yet → say ONE gentle push (framed as
+            exception), DO NOT lock yet — wait for the reply.
+          • <25 % after the gentle push → accept anyway with reassurance,
+            mark below-threshold so Stage 4 adds the follow-up line.
+
+        Args:
+            first_amount: SAR for the named first instalment.
+            first_date_iso: ISO date the customer named for it.
+        """
+        if self._amount_int <= 0:
+            # Defensive: no total to compare against — accept.
+            ctx.userdata.commitment = (
+                f"initial {int(first_amount)} SAR on {first_date_iso}, "
+                f"remainder TBD"
+            )
+            ctx.userdata.outcome = "committed"
+            return Stage4RecapAgent(self.data, chat_ctx=None)
+
+        pct = first_amount / self._amount_int
+
+        if pct >= 0.30:
+            ctx.userdata.commitment = (
+                f"initial {int(first_amount)} SAR on {first_date_iso}, "
+                f"remainder {self._amount_int - int(first_amount)} SAR TBD"
+            )
+            ctx.userdata.outcome = "committed"
+            ctx.userdata.below_threshold_commit = False
+            self.session.generate_reply(
+                instructions=(
+                    'Say ONE short encouraging line, then move to recap: '
+                    '"زَيْنْ، اتَّفَقْنَا — أُكِّدْ لِي التَّارِيخْ."'
+                )
+            )
+            return Stage4RecapAgent(self.data, chat_ctx=None)
+
+        if pct >= 0.25:
+            ctx.userdata.commitment = (
+                f"initial {int(first_amount)} SAR on {first_date_iso}, "
+                f"remainder {self._amount_int - int(first_amount)} SAR TBD"
+            )
+            ctx.userdata.outcome = "committed"
+            ctx.userdata.below_threshold_commit = False
+            self.session.generate_reply(
+                instructions=(
+                    'Say ONE short reassuring line: "تَمَامْ، نَلْتَزِمْ '
+                    'بِالتَّارِيخْ."'
+                )
+            )
+            return Stage4RecapAgent(self.data, chat_ctx=None)
+
+        # pct < 25 %
+        if not ctx.userdata.gentle_pushed:
+            ctx.userdata.gentle_pushed = True
+            self.session.generate_reply(
+                instructions=(
+                    'ONE gentle push, framed as exception (diacritics '
+                    'mandatory, NO digits):\n'
+                    '"كَاسْتِثْنَاءْ عَنْ الْمُعْتَادْ، تِقْدَرْ تْرَفَعَهْ '
+                    'لِحُدُودْ خَمْسَة وَعِشْرِينْ بِالْمِيَّة أَوْ '
+                    'ثَلَاثِينْ؟" One short sentence. Wait for the reply.'
+                )
+            )
+            return  # stay in this agent, await reply
+
+        # gentle push already used — accept the customer's amount.
+        ctx.userdata.commitment = (
+            f"initial {int(first_amount)} SAR on {first_date_iso}, "
+            f"remainder {self._amount_int - int(first_amount)} SAR TBD"
+        )
+        ctx.userdata.outcome = "committed_partial"
+        ctx.userdata.below_threshold_commit = True
+        self.session.generate_reply(
+            instructions=(
+                'Lock the plan with reassurance, NO blame. ONE short '
+                'sentence: "تَمَامْ، نَلْتَزِمْ بِالتَّارِيخْ، وَبِنْتَوَاصَلْ '
+                'مَعَكْ قَرِيبْ لِتَرْتِيبْ الْبَاقِي."'
+            )
+        )
         return Stage4RecapAgent(self.data, chat_ctx=None)
 
     @function_tool()
@@ -1275,8 +1537,9 @@ class Stage3NegotiationAgent(BaseCallAgent):
         first_amount: float,
         first_date_iso: str,
     ):
-        """Initial payment agreed but the remainder is vague — capture
-        what we have and schedule a follow-up call.
+        """Initial payment agreed but the remainder date is genuinely vague
+        after ONE clarification — capture what we have and schedule a
+        follow-up call.
 
         Args:
             first_amount: SAR for the initial good-faith payment.
@@ -1288,30 +1551,78 @@ class Stage3NegotiationAgent(BaseCallAgent):
             f"remainder {remainder} SAR TBD"
         )
         ctx.userdata.outcome = "committed_partial"
+        if self._amount_int > 0:
+            ctx.userdata.below_threshold_commit = (
+                first_amount / self._amount_int
+            ) < 0.25
         return RescheduleAgent(self.data, chat_ctx=None)
 
     @function_tool()
     async def vague_response(self, ctx: RunContext[CallData]):
-        """No concrete amount/date after offers — go to callback scheduling."""
+        """No concrete amount/date after one clarification — switch to
+        scheduling a callback to confirm the date later (PDF 3.3)."""
         ctx.userdata.vague_attempts += 1
         return RescheduleAgent(self.data, chat_ctx=None)
 
     @function_tool()
     async def refuses_payment(self, ctx: RunContext[CallData]):
-        """Flat refusal — close politely (no pressure)."""
+        """Flat refusal — close politely with the credit-record line
+        (PDF 3.3 refusal close)."""
         ctx.userdata.outcome = "refusal"
         return ClosingAgent(self.data, intent="refusal", chat_ctx=None)
 
     @function_tool()
+    async def stalemate_disclose(self, ctx: RunContext[CallData]):
+        """Customer kept denying the debt after the ladder. Deliver the
+        canonical stalemate disclosure ONCE (SIMAH + legal action + court
+        fees, framed as standard procedure — never as personal threat),
+        then ask one final commitment question.
+
+        Do NOT call this on a first denial — only after the ladder has
+        been worked. Do NOT call it on financial refusal — use
+        refuses_payment for that.
+        """
+        if ctx.userdata.stalemate_disclosed:
+            # Already said — second time around go straight to dispute.
+            ctx.userdata.outcome = "dispute"
+            _emit_outcome(ctx.userdata, "dispute_open")
+            return ClosingAgent(self.data, intent="dispute", chat_ctx=None)
+        ctx.userdata.stalemate_disclosed = True
+        self.session.generate_reply(
+            instructions=(
+                'Say EXACTLY as ONE connected reply (diacritics mandatory, '
+                'NO digits, NEVER soften the wording):\n'
+                '"التَّأْخِيرْ مُمْكِنْ يِنْعَكِسْ عَلَى سِجِلَّكْ '
+                'الِائْتِمَانِي فِي سِمَه. وَلَوْ مَا تَمْ السَّدَادْ، '
+                'مُمْكِنْ يِتْرَتَّبْ عَلَى ذَلِكْ إِجْرَاءَاتْ '
+                'قَانُونِيَّة وَرُسُومْ مَحْكَمَة حَسَبْ الْإِجْرَاءَاتْ '
+                'الْمُتَّبَعَة. نِقْدَرْ نِتَّفِقْ عَلَى مَبْلَغْ '
+                'وَتَارِيخْ الْآنْ؟"\n'
+                "Wait for the reply. Do NOT call any tool in this turn."
+            )
+        )
+        # remain in this agent — the customer's reply will trigger one of
+        # commit_full / commit_two_step / propose_installment / disputes_debt.
+
+    @function_tool()
     async def disputes_debt(self, ctx: RunContext[CallData]):
-        """Customer disputes the debt."""
+        """Customer still refuses to commit after the stalemate disclosure
+        — route to the official dispute channel."""
         ctx.userdata.outcome = "dispute"
         _emit_outcome(ctx.userdata, "dispute_open")
         return ClosingAgent(self.data, intent="dispute", chat_ctx=None)
 
     @function_tool()
-    async def already_paid(self, ctx: RunContext[CallData]):
-        """Customer asserts the debt is already paid."""
+    async def already_paid_done(
+        self, ctx: RunContext[CallData], when_text: str = "غير محدد",
+    ):
+        """Customer asserts the debt is already paid AND you have asked
+        when + reminded them to send the receipt.
+
+        Args:
+            when_text: short free-text of when they said they paid.
+        """
+        ctx.userdata.payment_made_when = when_text
         ctx.userdata.outcome = "paid"
         return ClosingAgent(self.data, intent="paid", chat_ctx=None)
 
@@ -1375,18 +1686,24 @@ class RescheduleAgent(BaseCallAgent):
 # ============================================================
 
 STAGE4_TASK = """\
-Current stage: 4 — Recap + payment methods + confirmation.
+Current stage: 4 — Recap + payment methods + confirmation (PDF 3.4).
 
 Deliver as a SINGLE concise reply (max ~3 short sentences, no monologue).
-The diacritics are MANDATORY — do NOT remove them, do NOT emit any digits:
+The diacritics are MANDATORY — do NOT remove them, do NOT emit any digits.
+SADAD biller code is FIVE-FIVE-ZERO, spoken as "خَمْسَة خَمْسَة صِفِرْ":
 
   "لِلتَّأْكِيدْ، الِاتِّفَاقْ هُوَ: {plan_summary}. تِقْدَرْ تْسَدِّدْ
   عَبْرْ سَدَادْ بِاسْتِخْدَامْ رَقَمْ الْهَوِيَّة الْوَطَنِيَّة وَكُودْ
-  الْمُفَوْتِرْ صِفِرْ صِفِرْ خَمْسَة، أَوْ مِنْ تَطْبِيقْ الْبَنْكْ،
+  الْمُفَوْتِرْ خَمْسَة خَمْسَة صِفِرْ، أَوْ مِنْ تَطْبِيقْ الْبَنْكْ،
   أَوْ تَطْبِيقْ مُوبَايْلِي، أَوْ أَقْرَبْ فَرْعْ مُوبَايْلِي، أَوْ
   الصَّرَّافْ الْآلِي. بَعْدْ السَّدَادْ، أَرْسِلْ لَنَا إِيصَالْ الدَّفْعْ
   لِلتَّأْكِيدْ. بِنْتَوَاصَلْ مَعَكْ فِي التَّارِيخْ الْمُتَّفَقْ عَلَيْهْ.
   مَضْبُوطْ؟"
+
+If the locked first instalment was BELOW 25 % of the total, INSERT one
+warm follow-up line before "بِنْتَوَاصَلْ" — the orchestrator passes
+{below_threshold_line} containing it (empty string when not applicable):
+  "{below_threshold_line}"
 
 If the agreement is a CALLBACK (no payment commitment), say instead:
   "لِلتَّأْكِيدْ، بِنْتَوَاصَلْ مَعَكْ يَوْمْ {callback_summary}. مَضْبُوطْ؟"
@@ -1405,12 +1722,18 @@ class Stage4RecapAgent(BaseCallAgent):
     def __init__(self, data: CallData, *, chat_ctx: ChatContext | None = None) -> None:
         plan_summary = data.commitment or "(no commitment recorded)"
         callback_summary = data.callback_time or "(none)"
+        below_threshold_line = (
+            "وَبِنْتَوَاصَلْ مَعَكْ قَرِيبْ لِتَرْتِيبْ الْبَاقِي."
+            if data.below_threshold_commit
+            else ""
+        )
         super().__init__(
             instructions=stage_instructions(
                 data,
                 STAGE4_TASK.format(
                     plan_summary=plan_summary,
                     callback_summary=callback_summary,
+                    below_threshold_line=below_threshold_line,
                 ),
             ),
             chat_ctx=chat_ctx,
@@ -1422,17 +1745,23 @@ class Stage4RecapAgent(BaseCallAgent):
         has_callback = bool(self.data.callback_time)
 
         if has_commitment:
+            follow_up = (
+                ' وَبِنْتَوَاصَلْ مَعَكْ قَرِيبْ لِتَرْتِيبْ الْبَاقِي.'
+                if self.data.below_threshold_commit
+                else ''
+            )
             hint = (
                 'Say the recap EXACTLY as ONE concise reply (diacritics '
-                'mandatory, no digits, end with "مَضْبُوطْ؟"):\n'
+                'mandatory, no digits, SADAD biller code is "خَمْسَة خَمْسَة '
+                'صِفِرْ", end with "مَضْبُوطْ؟"):\n'
                 f'"لِلتَّأْكِيدْ، الِاتِّفَاقْ هُوَ: {self.data.commitment}. '
                 'تِقْدَرْ تْسَدِّدْ عَبْرْ سَدَادْ بِاسْتِخْدَامْ رَقَمْ '
-                'الْهَوِيَّة الْوَطَنِيَّة وَكُودْ الْمُفَوْتِرْ صِفِرْ '
-                'صِفِرْ خَمْسَة، أَوْ تَطْبِيقْ الْبَنْكْ، أَوْ تَطْبِيقْ '
+                'الْهَوِيَّة الْوَطَنِيَّة وَكُودْ الْمُفَوْتِرْ خَمْسَة '
+                'خَمْسَة صِفِرْ، أَوْ تَطْبِيقْ الْبَنْكْ، أَوْ تَطْبِيقْ '
                 'مُوبَايْلِي، أَوْ أَقْرَبْ فَرْعْ مُوبَايْلِي، أَوْ '
                 'الصَّرَّافْ الْآلِي. بَعْدْ السَّدَادْ، أَرْسِلْ لَنَا '
-                'إِيصَالْ الدَّفْعْ. بِنْتَوَاصَلْ مَعَكْ فِي التَّارِيخْ '
-                'الْمُتَّفَقْ عَلَيْهْ. مَضْبُوطْ؟"\n'
+                f'إِيصَالْ الدَّفْعْ.{follow_up} بِنْتَوَاصَلْ مَعَكْ فِي '
+                'التَّارِيخْ الْمُتَّفَقْ عَلَيْهْ. مَضْبُوطْ؟"\n'
                 'Convert any digits in the plan to Arabic words before speaking.'
             )
         elif has_callback:
@@ -1485,8 +1814,9 @@ _CLOSING_HINTS = {
         'وبنتواصل معك قريب بإذن الله." TWO short sentences max.'
     ),
     "paid": (
-        'Acknowledge: "شكراً لك. مدوّن، وراح يتم تحديث السجل في أقرب وقت. '
-        'يعطيك العافية." ONE or TWO short sentences.'
+        'Acknowledge and remind ONCE about the receipt (PDF 3.2): '
+        '"شكراً لك، مدوّن — لا تنسى ترسل لنا إيصال السداد للتحقق. '
+        'يعطيك العافية." ONE or TWO short sentences. Do NOT add anything else.'
     ),
     "busy": 'Say: "أبشر، بنتواصل معك في وقت مناسب لك بإذن الله." ONE short sentence.',
     "busy_callback": (
@@ -1494,12 +1824,16 @@ _CLOSING_HINTS = {
         "thank the customer, and say goodbye. ONE or TWO short sentences."
     ),
     "dnc": (
-        "Acknowledge the DNC request, confirm it will be recorded, apologise "
-        "for the disturbance, say goodbye. ONE short sentence."
+        'Say EXACTLY the canonical DNC line (PDF 4.1) then goodbye. ONE '
+        'sentence: "تَمْ تَسْجِيلْ طَلَبْ عَدَمْ التَّوَاصُلْ الْهَاتِفِي، '
+        'وَالتَّوَاصُلْ سَيَكُونْ كِتَابِيًّا فَقَطْ مِنْ الْآنْ. '
+        'يَعْطِيكْ الْعَافْيَة."'
     ),
     "death": (
-        'Express condolences (الله يرحمه ويغفر له), thank the caller for '
-        "letting you know, say goodbye. ONE or TWO short sentences."
+        'Say EXACTLY the canonical condolences line (PDF 4.2): '
+        '"نَسْأَلْ اللهْ لَهْ الرَّحْمَة وَالْمَغْفِرَة. لِلتَّحْدِيثْ '
+        'الرَّسْمِي، تَوَاصَلُوا مَعْ أَقْرَبْ فَرْعْ مُوبَايْلِي. '
+        'يَعْطِيكْ الْعَافْيَة." ONE or TWO short sentences.'
     ),
     "wrong_party": (
         'Apologise for the mix-up: "آسفة على الإزعاج، يعطيك العافية." '
@@ -1510,12 +1844,19 @@ _CLOSING_HINTS = {
         "ONE short sentence."
     ),
     "refusal": (
-        'Acknowledge respectfully: "أشكرك على وقتك، وبنتواصل معك في وقت '
-        'مناسب لك بإذن الله." ONE short sentence. NO pressure.'
+        'Deliver the credit-record consequences line ONCE (PDF 3.3 refusal '
+        'close) then close respectfully. ONE-to-TWO short sentences, no '
+        'pressure, no threats:\n'
+        '"خَلِّينَا نِقْفِلْهَا خِلَالْ سَبْعَة أَيَّامْ بِحَدْ أَقْصَى '
+        'قَدْرْ الْإِمْكَانْ، عَشَانْ التَّأْخِيرْ مُمْكِنْ يِنْعَكِسْ '
+        'بِشَكْلْ سَلْبِي عَلَى سِجِلَّكْ الِائْتِمَانِي فِي سِمَه حَسَبْ '
+        'الْإِجْرَاءَاتْ الْمُتَّبَعَة. يَعْطِيكْ الْعَافْيَة."'
     ),
     "dispute": (
-        "Acknowledge the dispute, say it will be reviewed by the relevant "
-        "team and someone will follow up, say goodbye. ONE or TWO short sentences."
+        'Acknowledge calmly and direct the customer to the official '
+        'dispute channel (Mobily app or nearest branch): "فَهِمْتْ، يِمْكِنَكْ '
+        'تَقْدِيمْ اعْتِرَاضْ رَسْمِي عَبْرْ تَطْبِيقْ مُوبَايْلِي أَوْ '
+        'أَقْرَبْ فَرْعْ. يَعْطِيكْ الْعَافْيَة." ONE or TWO short sentences.'
     ),
     "verify_refused": (
         "Apologise that we cannot continue without verification, invite him "
@@ -1692,8 +2033,8 @@ async def entrypoint(ctx: JobContext):
             },
         },
         stt=stt_impl,
-        #llm=openai.LLM(model="gpt-4.1-mini", temperature=0.4),
-        llm=google.LLM(model="google/gemini-2.5-flash-lite"),
+        llm=openai.LLM(model="gpt-4.1-mini", temperature=0.4),
+        #llm=google.LLM(model="google/gemini-2.5-flash-lite"),
         tts=faseeh.TTS(
             base_url="https://api.munsit.com/api/v1",
             voice_id="ar-hijazi-female-2",
